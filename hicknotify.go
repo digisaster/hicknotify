@@ -10,8 +10,6 @@ import "strconv"
 import "time"
 import "encoding/json"
 import "os"
-import "gopkg.in/gomail.v2"
-import "os/exec"
 
 type Event struct {
   etype string
@@ -45,21 +43,6 @@ func GenerateTimeout(config Config, camera *Camera, lc chan bool, ec chan Event)
     }
   }
 }
-func GeneratePresence(wg *sync.WaitGroup, config Config, host string, hc chan bool) {
-  defer wg.Done()
-
-  for {
-    cmd := exec.Command("ping", "-c", "1", host)
-    err := cmd.Run()
-    if err == nil {
-      hc <- true
-    } else {
-      fmt.Println("PING FAILED", host, err)
-    }
-
-    time.Sleep(config.PingInterval * time.Second)
-  }
-}
 
 func GenerateEvents(wg *sync.WaitGroup, config Config, camera Camera, ec chan Event) {
   var last_attempt time.Time
@@ -85,14 +68,14 @@ func GenerateEvents(wg *sync.WaitGroup, config Config, camera Camera, ec chan Ev
     etyper := regexp.MustCompile("eventType>(.*)</eventType")
     estater := regexp.MustCompile("eventState>(.*)</eventState")
     ecountr := regexp.MustCompile("activePostCount>(.*)</activePostCount")
-
+	
     request, err := http.NewRequest("GET", camera.Url, nil)
     if err != nil {
       fmt.Println("REQUEST ERROR", camera, err)
       continue
     }
 
-    request.SetBasicAuth(config.Username, config.Password)
+    request.SetBasicAuth(camera.Username, camera.Password)
 
     resp, err := client.Do(request)
     if err != nil {
@@ -110,9 +93,10 @@ func GenerateEvents(wg *sync.WaitGroup, config Config, camera Camera, ec chan Ev
       // Send keepalive
       lc <- true
       //Uncomment this line to dump all notifications
-      //fmt.Println(string(line))
+      fmt.Println(string(line))
 
       line = bytes.TrimRight(line, "\n\r")
+	  
       etypes := etyper.FindSubmatch(line)
       if len(etypes) > 0 {
         event.etype = string(etypes[1])
@@ -128,45 +112,44 @@ func GenerateEvents(wg *sync.WaitGroup, config Config, camera Camera, ec chan Ev
       }
       if event.Complete() {
         if event.etype != "videoloss" {
+        //if event.etype == "videoloss" {
           ec <- event
+		//fmt.Println("SENDING NOTIFICATION FOR", event.etype, event.estate, event.ecount)
         }
-        event.Reset()
+	        event.Reset()
         event.camera = &camera
       }
     }
   }
 }
 
+
 type Camera struct {
   Url string
   Name string
+  Username string
+  Password string
+
 }
+
+
 
 type Config struct {
   Cameras []Camera
-  Hosts []string
-
-  Username string
-  Password string
+  DomoticzHost string
+  DomoticzPort string
+  DomoticzBasicAuth bool
+  DomoticzUsername string
+  DomoticzPassword string
+  LineCrossidx string
 
   DampeningTime time.Duration
   ErrorRetryTime time.Duration
   WatchdogTime time.Duration
-
-  MailFrom string
-  MailTo []string
-
-  MailServer string
-  MailPort int
-  MailUser string
-  MailPassword string
-
-  PingInterval time.Duration
-  PingDisable time.Duration
 }
 
 func LoadConfig() (Config, error) {
-  file, err := os.Open("config.json")
+  file, err := os.Open("/home/pi/domoticz/scripts/ipcamera/config.json")
   if err != nil {
     return Config{}, err
   }
@@ -186,52 +169,49 @@ func LoadConfig() (Config, error) {
   if configuration.WatchdogTime <= 0 {
     configuration.WatchdogTime = 5
   }
-  if configuration.PingInterval <= 0 {
-    configuration.PingInterval = 1
-  }
-  if configuration.PingDisable <= 0 {
-    configuration.PingDisable = 600
-  }
   return configuration, nil
 }
 
-func SendMail(config Config, event Event, now time.Time) {
-  fmt.Println("SENDING NOTIFICATION FOR", event, event.camera.Name, now)
-  m := gomail.NewMessage()
-  m.SetHeader("From", config.MailFrom)
-  m.SetHeader("To", config.MailTo...)
-  m.SetHeader("Subject", fmt.Sprintf("[NVR] Event in '%s'", event.camera.Name))
-  m.SetBody("text/html", fmt.Sprintf("Event: %s<br>State: %s<br>Count: %d<br>At: %s<br>In: %s<br>Url: %s",
-                                     event.etype, event.estate, event.ecount, now, event.camera.Name, event.camera.Url))
+func domoticz(config Config, event Event, now time.Time) {
 
-  d := gomail.NewDialer(config.MailServer, config.MailPort, config.MailUser, config.MailPassword)
-  err := d.DialAndSend(m)
-  if err != nil {
-    fmt.Println("ERROR SENDING NOTIFICATION", err)
+  if event.etype == "linedetection" && event.estate == "active" {
+
+    fmt.Println("SENDING NOTIFICATION FOR", event, event.camera, now) 
+    client := &http.Client{}
+    urlstr := fmt.Sprintf("http://%s:%s/json.htm?type=command&param=switchlight&idx=%s&switchcmd=On", config.DomoticzHost, config.DomoticzPort, config.LineCrossidx)
+    request, err := http.NewRequest("GET", urlstr, nil)
+    if config.DomoticzBasicAuth {
+	  request.SetBasicAuth(config.DomoticzUsername, config.DomoticzPassword)
+	}
+    fmt.Println(urlstr)
+    client.Do(request)
+
+    if err != nil {
+      fmt.Println(err)
+    }
   }
+
+
+
 }
 
+
 func main() {
+
   config, err := LoadConfig()
   if err != nil {
     fmt.Println("COULD NOT READ CONFIG", err)
     return
   }
-
-  hc := make(chan bool)
+  
   ec := make(chan Event)
   wg := &sync.WaitGroup{}
   for _, camera := range config.Cameras {
-    fmt.Println("MONITORING CAMERA", camera)
-
+    fmt.Println("Hiknotify starting... " )
+    fmt.Println("Hiknotify listening to Camera : ", config.Cameras )
+    fmt.Println("Hiknotify started ..." )
     wg.Add(1)
     go GenerateEvents(wg, config, camera, ec)
-  }
-
-  for _, host := range config.Hosts {
-    fmt.Println("MONITORING HOST", host)
-    wg.Add(1)
-    go GeneratePresence(wg, config, host, hc)
   }
 
   type DampKey struct {
@@ -239,24 +219,19 @@ func main() {
     camera *Camera
   }
 
-  var hostsilence time.Time
   dampener := make(map[DampKey]time.Time)
   for {
     select {
-      case <-hc:
-        //fmt.Println("HOST DETECTED", hostsilence)
-        hostsilence = time.Now()
-        break;
 
       case event := <-ec:
         key := DampKey{event.etype, event.camera}
         last, ok := dampener[key]
         now := time.Now()
-        if now.After(hostsilence.Add(config.PingDisable * time.Second)) && (!ok || now.After(last.Add(config.DampeningTime * time.Second))) {
-          SendMail(config, event, now)
+        if !ok || now.After(last.Add(config.DampeningTime * time.Second)) {
+          domoticz(config, event, now)
           dampener[key] = now
         } else {
-          // fmt.Println("TIME DAMPENED ", event, key)
+          fmt.Println("TIME DAMPENED ", event, key)
           dampener[key] = time.Now()
         }
         break;
